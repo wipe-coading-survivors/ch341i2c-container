@@ -1,8 +1,8 @@
 # AGENTS.md
 
 Репозиторий-компаньон mlxini: собирает образ `mlxini-ch341i2c`
-(CH341 USB↔I2C). Ремоут github — только через PR: прямой пуш в master
-авто-ревертит master-guard.
+(CH341 USB↔I2C). Пуш в master на GitHub — только через PR (master-guard
+авто-ревертит прямой пуш): ветка → PR → merge.
 
 ## Кодовые правила
 
