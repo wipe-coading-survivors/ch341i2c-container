@@ -1,0 +1,57 @@
+#!/bin/sh
+# safe-rm — rm -rf with guards (AGENTS.md rule rm-rf-guard).
+#
+#   safe-rm --under ROOT TARGET...
+#
+# ROOT and every TARGET must be absolute paths. A target is removed only if
+# its canonical path (readlink -e) equals ROOT's canonical path or lies under
+# it. A target that is a mount point (checked with findmnt --mountpoint,
+# including /) is never removed. All targets are checked before anything is
+# removed; on any refusal nothing is removed and the exit code is 1. A target
+# that does not exist is a no-op. If findmnt is not available, safe-rm
+# refuses (fail-closed).
+
+die() {
+    echo "safe-rm: $*" >&2
+    exit 1
+}
+
+[ "${1:-}" = "--under" ] || die "usage: safe-rm --under ROOT TARGET..."
+shift
+[ $# -ge 2 ] || die "usage: safe-rm --under ROOT TARGET..."
+
+root=$1
+shift
+
+command -v findmnt > /dev/null 2>&1 || die "findmnt not found, refusing (fail-closed)"
+
+case $root in
+    /*) : ;;
+    *) die "root must be an absolute path: $root"
+       ;;
+esac
+
+root_canon=$(readlink -e -- "$root" 2>/dev/null) || die "root does not exist: $root"
+
+validate() {
+    t=$1
+    c=$(readlink -e -- "$t" 2>/dev/null) || return 0
+    findmnt --mountpoint "$c" > /dev/null 2>&1 && die "refusing to remove mount point: $c"
+    case $c in
+        "$root_canon" | "$root_canon"/*) return 0 ;;
+    esac
+    die "target is outside root: $c (root: $root_canon)"
+}
+
+for t in "$@"; do
+    case $t in
+        /*) : ;;
+        *) die "target must be an absolute path: $t"
+           ;;
+    esac
+    validate "$t"
+done
+
+for t in "$@"; do
+    rm -rf -- "$t"
+done

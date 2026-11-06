@@ -1,0 +1,3 @@
+# Copy to local.mk (gitignored) and adjust. Defaults live in Makefile (?=).
+# Tag of the image built here and consumed by mlxini.
+#CH341_IMAGE = mlxini-ch341i2c
