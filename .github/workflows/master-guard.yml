@@ -1,0 +1,197 @@
+name: master-guard
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Guard master (PR-only pushes)
+        run: |
+          set -uo pipefail
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          ACTOR="${{ github.actor }}"
+          REPO="${GITHUB_REPOSITORY}"
+          API="https://api.github.com"
+          ZERO=0000000000000000000000000000000000000000
+          api() {
+            curl -sf --retry 2 -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$@"
+          }
+          fail_manual() {
+            echo "::error::master-guard: $1 - manual review required, no revert performed."
+            exit 1
+          }
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            fail_manual "github.token is not available in this environment"
+          fi
+
+          if [ "$ACTOR" = "github-actions[bot]" ]; then
+            echo "Push by github-actions[bot] (guard revert merge) - skipping check."
+            exit 0
+          fi
+
+          if [ -z "$AFTER" ] || [ "$AFTER" = "$ZERO" ]; then
+            fail_manual "unexpected empty push payload (after=${AFTER})"
+          fi
+
+          violation=""
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "$ZERO" ]; then
+            violation="first push to master (no previous tip)"
+          else
+            CMP_JSON=""
+            for attempt in 1 2 3; do
+              if CMP_JSON=$(api "$API/repos/$REPO/compare/${BEFORE}...${AFTER}"); then
+                break
+              fi
+              [ "$attempt" -lt 3 ] && sleep 10
+            done
+            [ -n "$CMP_JSON" ] || fail_manual "compare API failed"
+            STATUS=$(echo "$CMP_JSON" | jq -r .status)
+            if [ "$STATUS" != "ahead" ]; then
+              violation="non fast-forward push (compare status: ${STATUS}); force pushes are not allowed"
+            else
+              COUNT=$(echo "$CMP_JSON" | jq '.total_commits // (.commits | length)')
+              if [ "$COUNT" -eq 0 ]; then
+                fail_manual "compare returned no commits for an ahead status"
+              fi
+              if [ "$COUNT" -gt 50 ]; then
+                echo "Push range has ${COUNT} commits; checking only the tip commit."
+                SHAS="$AFTER"
+              else
+                SHAS=$(echo "$CMP_JSON" | jq -r '.commits[].sha')
+              fi
+              for sha in $SHAS; do
+                ok=0
+                confirmed_empty=0
+                for attempt in 1 2 3 4; do
+                  if PULLS_JSON=$(api "$API/repos/$REPO/commits/${sha}/pulls"); then
+                    N=$(echo "$PULLS_JSON" | jq 'length')
+                    if [ "$N" -gt 0 ]; then
+                      ok=1
+                      break
+                    fi
+                    confirmed_empty=1
+                  else
+                    confirmed_empty=0
+                  fi
+                  [ "$attempt" -lt 4 ] && sleep 15
+                done
+                if [ "$ok" -eq 1 ]; then
+                  continue
+                fi
+                if [ "$confirmed_empty" -eq 1 ]; then
+                  violation="direct push (commit not associated with any PR): ${sha}"
+                else
+                  fail_manual "association check for commit ${sha} failed (API error)"
+                fi
+              done
+            fi
+          fi
+
+          if [ -z "$violation" ]; then
+            echo "OK: all pushed commits are associated with merged PRs."
+            exit 0
+          fi
+
+          echo "::error::master-guard violation: ${violation} (actor: ${ACTOR})"
+
+          ISSUE_BODY="The master-guard workflow detected a push to \`master\` that did not come through a merged pull request.
+
+          - Violation: ${violation}
+          - Actor: ${ACTOR}
+          - Before: \`${BEFORE}\`
+          - After: \`${AFTER}\`
+          - Run: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}
+
+          An automatic revert PR is opened and merged when possible. If this run failed before the revert step, revert the push manually (see the run logs)."
+          ISSUE_TITLE="[master-guard] ${violation} - master ${AFTER:0:7} by ${ACTOR}"
+          api -X POST "$API/repos/$REPO/issues" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg t "$ISSUE_TITLE" --arg b "$ISSUE_BODY" '{title: $t, body: $b, labels: ["master-guard"]}')" >/dev/null \
+            || echo "::warning::master-guard: failed to create alert issue."
+
+          REVERT_OK=1
+          BRANCH="master-guard-revert-${AFTER:0:7}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "$ZERO" ]; then
+            REVERT_OK=0
+            echo "::warning::master-guard: auto-revert not possible for a first push to master."
+          else
+            git clone --branch master --depth 200 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" work || REVERT_OK=0
+            if [ "$REVERT_OK" -eq 1 ] && ! git -C work cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              git -C work fetch --unshallow origin master || REVERT_OK=0
+            fi
+            if [ "$REVERT_OK" -eq 1 ]; then
+              RVCOUNT=$(git -C work rev-list --count "${AFTER}" --not "${BEFORE}")
+              if [ "$RVCOUNT" -eq 0 ]; then
+                REVERT_OK=0
+                echo "::warning::master-guard: no commits to revert."
+              elif [ "$RVCOUNT" -gt 50 ]; then
+                REVERT_OK=0
+                echo "::warning::master-guard: push range has ${RVCOUNT} commits (>50) - auto-revert skipped."
+              else
+                git -C work config user.name "github-actions[bot]"
+                git -C work config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                git -C work checkout -b "$BRANCH" || REVERT_OK=0
+                if [ "$REVERT_OK" -eq 1 ]; then
+                  FAILED=0
+                  for sha in $(git -C work rev-list "${AFTER}" --not "${BEFORE}"); do
+                    if git -C work log -1 --pretty=%P "$sha" | grep -q ' '; then
+                      git -C work revert --no-edit -m 1 "$sha" || { FAILED=1; break; }
+                    else
+                      git -C work revert --no-edit "$sha" || { FAILED=1; break; }
+                    fi
+                  done
+                  if [ "$FAILED" -ne 0 ]; then
+                    git -C work revert --abort || true
+                    REVERT_OK=0
+                    echo "::warning::master-guard: git revert failed (conflict?) - auto-revert skipped."
+                  else
+                    git -C work push origin "$BRANCH" || REVERT_OK=0
+                  fi
+                fi
+              fi
+            fi
+          fi
+
+          if [ "$REVERT_OK" -eq 1 ]; then
+            PR_PAYLOAD=$(jq -n --arg h "$BRANCH" --arg t "master-guard: revert direct push ${AFTER:0:7} by ${ACTOR}" --arg b "$ISSUE_BODY" '{head: $h, base: "master", title: $t, body: $b}')
+            PR_JSON=""
+            PR_HTTP=""
+            PR_ERR=""
+            for attempt in 1 2 3 4 5; do
+              PR_RESPONSE=$(curl -s -w '\n%{http_code}' -X POST "$API/repos/$REPO/pulls" -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" -d "$PR_PAYLOAD") || PR_RESPONSE="000"
+              PR_HTTP=$(echo "$PR_RESPONSE" | tail -n 1)
+              PR_JSON=$(echo "$PR_RESPONSE" | head -n -1)
+              if [ "${PR_HTTP}" -ge 200 ] 2>/dev/null && [ "${PR_HTTP}" -lt 300 ] 2>/dev/null; then
+                break
+              fi
+              PR_ERR=$(echo "$PR_JSON" | jq -r '.message // empty' 2>/dev/null || echo "$PR_JSON")
+              [ "$attempt" -lt 5 ] && sleep 5
+            done
+            if [ -n "$PR_JSON" ] && echo "$PR_JSON" | jq -e .number >/dev/null 2>&1; then
+              PR_NUM=$(echo "$PR_JSON" | jq -r .number)
+              if api -X PUT "$API/repos/$REPO/pulls/${PR_NUM}/merge" -H "Content-Type: application/json" -d '{"merge_method":"merge"}' >/dev/null; then
+                echo "Auto-revert PR #${PR_NUM} opened and merged."
+              else
+                REVERT_OK=0
+                echo "::warning::master-guard: revert PR #${PR_NUM} opened but merge failed - merge it manually."
+              fi
+            else
+              REVERT_OK=0
+              echo "::warning::master-guard: revert branch ${BRANCH} pushed but PR creation failed (HTTP ${PR_HTTP:-?}: ${PR_ERR:-unknown}) - create and merge the PR manually."
+            fi
+          fi
+
+          exit 1
